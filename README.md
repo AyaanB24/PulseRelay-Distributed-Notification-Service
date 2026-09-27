@@ -61,78 +61,54 @@ PulseRelay's core differentiator is not "sending notifications" — that's commo
 
 ```mermaid
 flowchart TB
-    Client["Client Application"] -- "POST /notifications" --> API
+    Client["Client Application"] -->|"POST /notifications"| API["PulseRelay API<br/>(Auth + Validation)"]
+    Dash["Developer Dashboard"] -->|"GET /notifications"| API
+    API -->|"202 Accepted"| Client
 
-    subgraph API["PulseRelay API"]
-        Auth["API Key Auth"]
-        Validate["Validation"]
-        Auth --> Validate
-    end
+    API -->|"write QUEUED"| DB[("PostgreSQL")]
+    API -->|"publish event"| Kafka["Kafka<br/>notification.events"]
 
-    Validate -- "persist + publish" --> PG1[("PostgreSQL<br/>Notification: QUEUED")]
-    Validate -- "persist + publish" --> Kafka["Kafka<br/>notification.events"]
-    API -- "202 Accepted" --> Client
-
-    Kafka --> Worker
+    Kafka --> W1
 
     subgraph Worker["Worker Pool"]
         direction TB
-        Idem["1 · Idempotency Check"]
-        Pref["2 · Preference Lookup"]
-        Route["3 · Delivery Decision Engine"]
-        Template["4 · Template Rendering"]
-        Limit["5 · Rate Limit Check"]
-        Idem --> Pref --> Route --> Template --> Limit
+        W1["1 . Idempotency Check"] --> W2["2 . Preference Lookup"]
+        W2 --> W3["3 . Delivery Decision Engine<br/>preference + priority + provider health"]
+        W3 --> W4["4 . Template Rendering"]
+        W4 --> W5["5 . Rate Limit Check"]
     end
 
-    Idem -. "unique idempotency_key" .-> PG1
-    Pref -. "read preferences" .-> PG1
+    W1 -.->|"idempotency_key lookup"| DB
+    W2 -.->|"read preferences"| DB
+    W5 -->|"check / increment"| Redis[("Redis")]
 
-    subgraph Decision["Delivery Decision Engine"]
-        direction LR
-        Pri["Preferences"]
-        Pr2["Priority"]
-        Health["Provider Health"]
-    end
-    Route -.-> Decision
-
-    Limit -- "check + increment" --> Redis[("Redis<br/>rate limits, counters")]
-
-    Limit --> Channel
-
-    subgraph Channel["Notification Channel (abstraction)"]
-        direction LR
-        EmailCh["Email"]
-        SmsCh["SMS"]
-        PushCh["Push"]
-    end
-
-    EmailCh --> SendGrid["SendGrid"]
-    SmsCh --> Twilio["Twilio"]
-    PushCh --> FCM["FCM"]
+    W5 --> Channel["Notification Channel<br/>provider abstraction"]
+    Channel --> SendGrid["SendGrid — Email"]
+    Channel --> Twilio["Twilio — SMS"]
+    Channel --> FCM["FCM — Push"]
 
     SendGrid --> Result["Delivery Result"]
     Twilio --> Result
     FCM --> Result
 
-    Result -- "UPDATE Notification.status<br/>INSERT DeliveryAttempt" --> PG2[("PostgreSQL<br/>Attempts, audit trail")]
+    Result -->|"update status +<br/>log attempt"| DB
+    Result -->|"on failure"| Retry["Retry + Backoff"]
+    Retry -->|"attempt again"| Channel
+    Retry -->|"max attempts reached"| DLQ["Kafka DLQ"]
 
-    Result -- "on failure" --> Retry["Retry + Exponential Backoff"]
-    Retry -- "attempt again" --> Channel
-    Retry -- "max attempts reached" --> DLQ["Kafka DLQ"]
-
-    API -- metrics --> Prom["Prometheus"]
-    Worker -- metrics --> Prom
-    Kafka -- metrics --> Prom
-    Prom -- query --> Grafana["Grafana"]
+    API --> Prom["Prometheus"]
+    Worker --> Prom
+    Prom --> Grafana["Grafana"]
+    Dash -->|"view metrics"| Grafana
 ```
 
 **Why it's built this way:**
-- **Idempotency runs first**, before any preference lookup or routing work, checked against a `UNIQUE` constraint on `idempotency_key` in PostgreSQL — Redis can short-circuit the common case, but Postgres is the final authority so a Kafka redelivery can never slip through as a duplicate at the database layer.
-- **The Delivery Decision Engine** — not a plain routing lookup — is the actual product feature: it weighs user preference, event priority, and live provider health together to pick a channel *and* a provider, which is what makes automatic failover possible.
-- **Every provider call happens behind a `NotificationChannel` abstraction**, not a direct SDK call from the worker. Adding a provider or failing over from one to another (SendGrid → a backup email provider) means adding an implementation, not rewriting the worker.
-- **Retry is explicit and bounded**: each failure is retried with exponential backoff and a capped attempt count, with every attempt recorded — only after attempts are exhausted does a message move to the DLQ. Nothing fails silently and nothing skips straight to the DLQ.
-- **Redis and PostgreSQL have distinct jobs**: Redis holds fast, ephemeral state (rate-limit counters, idempotency fast-path); PostgreSQL holds durable state (notification status, the full `DeliveryAttempt` history) — rate limiting is never backed by Postgres.
+- **Idempotency runs first**, before any preference lookup or routing work, checked against a `UNIQUE` constraint on `idempotency_key` in PostgreSQL — that's the final authority, so a Kafka redelivery can never slip through as a duplicate.
+- **The Delivery Decision Engine** — not a plain routing lookup — weighs user preference, event priority, and live provider health together to pick a channel *and* a provider. That's the actual product feature; it's what makes automatic failover possible.
+- **Every provider call goes through a `NotificationChannel` abstraction**, not a direct SDK call from the worker. Adding a provider or failing over from one to another means adding an implementation, not rewriting the worker.
+- **Retry is explicit and bounded**: each failure is retried with backoff and a capped attempt count, with every attempt logged — only once attempts are exhausted does a message move to the DLQ.
+- **Redis and PostgreSQL have distinct jobs**: Redis holds fast, ephemeral state (rate-limit counters, idempotency fast-path); PostgreSQL holds durable state (notification status, full delivery-attempt history). Rate limiting is never backed by Postgres.
+- **The dashboard never touches Kafka, Redis, or providers directly** — it reads exclusively through the API, which queries PostgreSQL for status and attempt history, so it can't drift out of sync with what actually happened.
 
 ---
 

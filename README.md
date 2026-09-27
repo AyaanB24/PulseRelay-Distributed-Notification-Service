@@ -59,54 +59,82 @@ PulseRelay's core differentiator is not "sending notifications" — that's commo
 
 ## Architecture
 
-```
-                              ┌─────────────────────────┐
-                              │   Developer Dashboard    │
-                              │   (React)                │
-                              └────────────┬─────────────┘
-                                           │
-                              ┌────────────▼─────────────┐
-                              │      REST API Layer      │
-                              │  (Spring Boot, API-key    │
-                              │   authenticated)          │
-                              └────────────┬─────────────┘
-                                           │  202 Accepted
-                                           ▼
-                                     ┌───────────┐
-                                     │   Kafka   │
-                                     │ (events)  │
-                                     └─────┬─────┘
-                                           ▼
-                              ┌────────────────────────┐
-                              │  Notification Engine     │
-                              │  ┌──────────┬─────────┐  │
-                              │  │Preference│ Routing │  │
-                              │  │ Lookup   │ & Policy│  │
-                              │  └──────────┴─────────┘  │
-                              │  ┌──────────────────────┐│
-                              │  │  Idempotency Check    ││
-                              │  └──────────────────────┘│
-                              └────────────┬─────────────┘
-                                           ▼
-                              ┌────────────────────────┐
-                              │   Delivery Workers       │
-                              └───┬────────┬────────┬───┘
-                                  ▼        ▼        ▼
-                              ┌──────┐ ┌──────┐ ┌──────┐
-                              │Email │ │ SMS  │ │ Push │
-                              │Prov. │ │Prov. │ │(FCM) │
-                              └───┬──┘ └───┬──┘ └───┬──┘
-                                  └────────┼────────┘
-                                           ▼
-                                     Real end user
+```mermaid
+flowchart LR
+    subgraph Client["Client"]
+        App["ShopX Backend"]
+    end
 
-Supporting infrastructure:
-  PostgreSQL  → durable source of truth (orgs, users, templates, delivery history)
-  Redis       → rate limiting, retry/backoff state
-  DLQ (Kafka) → failed messages after retry exhaustion
-  Prometheus  → metrics (queue lag, delivery rate, failure rate)
-  Grafana     → dashboards built on those metrics
+    subgraph API["PulseRelay API"]
+        Auth["API Key Auth"]
+        Persist["Persist + Publish"]
+    end
+
+    subgraph Queue["Message Queue"]
+        Kafka["Kafka<br/>notifications.events"]
+        DLQ["Kafka DLQ"]
+    end
+
+    subgraph Engine["Notification Worker Pool"]
+        Pref["Preference Lookup"]
+        Idem["Idempotency Check"]
+        Policy["Routing Policy"]
+        Template["Template Render"]
+        Limit["Rate Limit Check"]
+    end
+
+    subgraph Providers["Delivery Providers"]
+        SendGrid["SendGrid — Email"]
+        Twilio["Twilio — SMS"]
+        FCM["FCM — Push"]
+    end
+
+    subgraph Storage["Data Storage"]
+        PG[("PostgreSQL")]
+        Redis[("Redis")]
+    end
+
+    subgraph Observability["Observability Stack"]
+        Prom["Prometheus"]
+        Grafana["Grafana"]
+    end
+
+    App -- "HTTPS POST /notifications" --> Auth
+    Auth --> Persist
+    Persist -- "write QUEUED" --> PG
+    Persist -- "publish event" --> Kafka
+    Persist -- "202 Accepted" --> App
+
+    Kafka -- "consume" --> Pref
+    Pref -- "read prefs" --> PG
+    Pref --> Idem
+    Idem -- "check key" --> Redis
+    Idem --> Policy
+    Policy --> Template
+    Template --> Limit
+    Limit -- "check limit" --> Redis
+
+    Limit -- "execute" --> SendGrid
+    Limit -- "execute" --> Twilio
+    Limit -- "execute" --> FCM
+
+    SendGrid -- "result" --> PG
+    Twilio -- "result" --> PG
+    FCM -- "result" --> PG
+
+    SendGrid -. "on failure, exhausted retries" .-> DLQ
+    Twilio -. "on failure, exhausted retries" .-> DLQ
+    FCM -. "on failure, exhausted retries" .-> DLQ
+
+    API -- "metrics" --> Prom
+    Engine -- "metrics" --> Prom
+    Prom -- "query" --> Grafana
 ```
+
+**Why it's built this way:**
+- The API never blocks on provider delivery — it writes to Postgres, publishes to Kafka, and returns `202` in milliseconds. Delivery happens on the worker side, independently.
+- Preferences, idempotency, and rate-limit checks happen **inside the worker**, right before a provider is called — not in the API layer — so a burst of inbound requests doesn't get rejected outright, it gets queued and throttled downstream.
+- Postgres is written to twice in the lifecycle: once at ingestion (`QUEUED`) and again at delivery outcome (`DELIVERED`/`FAILED`) — that's what makes the dashboard's delivery history accurate rather than inferred.
 
 ---
 

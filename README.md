@@ -1,554 +1,307 @@
 # PulseRelay
 
-> **Reliable, distributed notification infrastructure for backend applications.**
+**A developer-facing notification orchestration platform.** Applications send a single API request; PulseRelay handles channel routing, templating, retries, rate limiting, provider failover, and delivery tracking across Email, SMS, and Push.
 
-PulseRelay is a **Spring Boot-based notification service** that centralizes Email, SMS, and Push notification delivery for backend applications.
-
-Instead of implementing notification logic separately in every application, services can send a request to PulseRelay and let it handle **delivery, retries, idempotency, tracking, rate limiting, and channel fallback**.
+[![Java](https://img.shields.io/badge/Java-17-orange)]()
+[![Spring Boot](https://img.shields.io/badge/Spring%20Boot-3.x-brightgreen)]()
+[![Kafka](https://img.shields.io/badge/Kafka-Event%20Streaming-black)]()
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-Database-blue)]()
+[![Redis](https://img.shields.io/badge/Redis-Rate%20Limiting-red)]()
+[![Docker](https://img.shields.io/badge/Docker-Containerized-2496ED)]()
+[![License](https://img.shields.io/badge/license-MIT-lightgrey)]()
 
 ---
 
-## What PulseRelay Provides
+## Overview
 
-### Reliable Notification Delivery
+Applications that need to notify their users typically end up calling email, SMS, and push providers directly from multiple services — duplicating provider integrations, retry logic, and delivery tracking everywhere they're needed. When a provider goes down or a template needs to change, every caller has to be touched.
 
-Centralizes notification delivery across multiple backend services through a single REST API.
+PulseRelay removes that duplication. A client application sends one authenticated request describing *what happened* (`ORDER_CONFIRMED`, `PAYMENT_FAILED`, etc.); PulseRelay decides *how* to deliver it — which channel, which provider, which template — and guarantees the notification is either delivered or provably failed, with a full audit trail.
 
-**Supported channels:**
-
-* Email
-* SMS
-* Push Notifications
-
-### Idempotent Processing
-
-Prevents duplicate notification processing using a unique **idempotency key**.
-
-If the same notification request is received multiple times, PulseRelay identifies the existing request instead of creating another notification.
-
-```text
-Request
-   ↓
-Idempotency Key
-   ↓
-Already Exists?
- ┌───────┴───────┐
-Yes              No
- ↓                ↓
-Return          Create
-Existing        Notification
+```
+Client App  →  PulseRelay API  →  Kafka  →  Notification Worker  →  Provider  →  End User
+                     │
+                     └──→ PostgreSQL (state) · Redis (rate limits) · Prometheus (metrics)
 ```
 
-### Automatic Retry
+---
 
-Temporary delivery failures are handled using **exponential backoff**.
+## Table of Contents
 
-```text
-Attempt 1 → Failed
-     ↓
-Wait
-     ↓
-Attempt 2 → Failed
-     ↓
-Wait longer
-     ↓
-Attempt 3 → Success
+- [Why PulseRelay](#why-pulserelay)
+- [Architecture](#architecture)
+- [System Flow](#system-flow)
+- [Core Features](#core-features)
+- [Tech Stack](#tech-stack)
+- [Getting Started](#getting-started)
+- [API Reference](#api-reference)
+- [Reliability Design](#reliability-design)
+- [Data Model](#data-model)
+- [Observability](#observability)
+- [Roadmap](#roadmap)
+- [Project Status](#project-status)
+
+---
+
+## Why PulseRelay
+
+| Without PulseRelay | With PulseRelay |
+|---|---|
+| Every service integrates its own email/SMS/push SDKs | One REST API, one API key |
+| Retry and failover logic duplicated per service | Centralized retry, backoff, and provider failover |
+| No unified view of what was sent or why it failed | Full delivery history and per-attempt audit log |
+| Hardcoded message strings in application code | Reusable, versioned templates |
+| Adding a channel means changing every caller | Adding a channel means configuring PulseRelay |
+
+PulseRelay's core differentiator is not "sending notifications" — that's commodity functionality any SDK provides. The value is **policy-driven delivery with automatic channel and provider failover**, so the calling application never has to know or care that a provider is degraded.
+
+---
+
+## Architecture
+
+```
+                              ┌─────────────────────────┐
+                              │   Developer Dashboard    │
+                              │   (React)                │
+                              └────────────┬─────────────┘
+                                           │
+                              ┌────────────▼─────────────┐
+                              │      REST API Layer      │
+                              │  (Spring Boot, API-key    │
+                              │   authenticated)          │
+                              └────────────┬─────────────┘
+                                           │  202 Accepted
+                                           ▼
+                                     ┌───────────┐
+                                     │   Kafka   │
+                                     │ (events)  │
+                                     └─────┬─────┘
+                                           ▼
+                              ┌────────────────────────┐
+                              │  Notification Engine     │
+                              │  ┌──────────┬─────────┐  │
+                              │  │Preference│ Routing │  │
+                              │  │ Lookup   │ & Policy│  │
+                              │  └──────────┴─────────┘  │
+                              │  ┌──────────────────────┐│
+                              │  │  Idempotency Check    ││
+                              │  └──────────────────────┘│
+                              └────────────┬─────────────┘
+                                           ▼
+                              ┌────────────────────────┐
+                              │   Delivery Workers       │
+                              └───┬────────┬────────┬───┘
+                                  ▼        ▼        ▼
+                              ┌──────┐ ┌──────┐ ┌──────┐
+                              │Email │ │ SMS  │ │ Push │
+                              │Prov. │ │Prov. │ │(FCM) │
+                              └───┬──┘ └───┬──┘ └───┬──┘
+                                  └────────┼────────┘
+                                           ▼
+                                     Real end user
+
+Supporting infrastructure:
+  PostgreSQL  → durable source of truth (orgs, users, templates, delivery history)
+  Redis       → rate limiting, retry/backoff state
+  DLQ (Kafka) → failed messages after retry exhaustion
+  Prometheus  → metrics (queue lag, delivery rate, failure rate)
+  Grafana     → dashboards built on those metrics
 ```
 
-Failed notifications are tracked through individual delivery attempts.
+---
 
-### Smart Channel Fallback
+## System Flow
 
-If the preferred channel repeatedly fails, PulseRelay can automatically switch to another configured channel.
+**1. Integration setup**
+A client creates an organization, generates an API key, and configures which channels/providers are enabled.
 
-```text
-EMAIL
-  ↓
-Failed
-  ↓
-SMS
-  ↓
-Failed
-  ↓
-PUSH
-```
-
-Example:
-
-> Email → SMS → Push
-
-This allows the calling application to rely on PulseRelay instead of implementing its own fallback logic.
-
-### Delivery Tracking
-
-Every notification has a lifecycle and delivery history.
-
-```text
-PENDING
-   ↓
-PROCESSING
-   ↓
-SENT
-
-or
-
-PENDING
-   ↓
-RETRYING
-   ↓
-FAILED
-```
-
-Individual delivery attempts are recorded with:
-
-* Attempt number
-* Status
-* Error message
-* Timestamp
-
-### API Security
-
-PulseRelay uses **API-key authentication** for service-to-service communication.
-
+**2. Sending a notification**
 ```http
-X-API-Key: <service-api-key>
-```
-
-This is designed for backend services rather than direct end-user authentication.
-
-### Rate Limiting
-
-Redis can be used to enforce request limits for client services and prevent excessive notification traffic.
-
-```text
-Client Service
-      ↓
-Redis Rate Limiter
-      ↓
-Allowed?
-   /     \
- Yes      No
- ↓        ↓
-API      429
-```
-
----
-
-# Architecture
-
-```text
-                    Client Services
-              ┌─────────┼─────────┐
-              │         │         │
-          Order      Payment    Auth
-          Service    Service    Service
-              │         │         │
-              └─────────┼─────────┘
-                        ↓
-                ┌───────────────┐
-                │  PulseRelay   │
-                │   REST API    │
-                └───────┬───────┘
-                        │
-              ┌─────────┴─────────┐
-              ↓                   ↓
-          PostgreSQL             Redis
-          Source of Truth      Rate Limit /
-                              Cache
-              │
-              ↓
-             Kafka
-              │
-              ↓
-       Notification Worker
-              │
-       ┌──────┼──────┐
-       ↓      ↓      ↓
-     Email   SMS    Push
-       │      │      │
-       └──────┼──────┘
-              ↓
-       Delivery Tracking
-```
-
----
-
-# Example Use Case
-
-Consider an e-commerce application.
-
-When an order is successfully placed:
-
-```text
-User
- ↓
-E-Commerce Application
- ↓
-POST /api/notifications
- ↓
-PulseRelay
- ↓
-Kafka
- ↓
-Notification Worker
- ↓
-Email Provider
- ↓
-User receives confirmation
-```
-
-Example request:
-
-```http
-POST /api/notifications
+POST /api/v1/notifications
+Authorization: Bearer pr_live_xxxxxxxxxxxxx
 Content-Type: application/json
-X-API-Key: <api-key>
-```
 
-```json
 {
-  "userId": 123,
-  "templateType": "ORDER_CONFIRMATION",
-  "channel": "EMAIL",
-  "idempotencyKey": "order-4821-confirmation"
+  "event": "ORDER_CONFIRMED",
+  "userId": "user_123",
+  "data": { "orderId": "ORD-4821", "amount": 2499 }
 }
 ```
-
-Response:
-
+PulseRelay responds immediately without waiting for delivery:
 ```json
-{
-  "notificationId": 781,
-  "status": "PENDING"
-}
+{ "notificationId": "ntf_10231", "status": "QUEUED" }
 ```
 
-The client can later check:
+**3. Routing decision**
+The Notification Engine resolves the user's channel preferences and the event's delivery policy, then selects a channel and a healthy provider.
 
-```http
-GET /api/notifications/781
-```
+**4. Template rendering**
+The event payload (`orderId`, `amount`, etc.) is merged into a stored, versioned template — the client never hardcodes message copy.
 
-Response:
+**5. Delivery + retry**
+A worker calls the provider SDK. On failure, PulseRelay retries with exponential backoff; on repeated failure it can fail over to a secondary provider or fall back to another channel entirely (e.g., Email → SMS) before landing in the DLQ.
 
-```json
-{
-  "notificationId": 781,
-  "status": "SENT"
-}
-```
+**6. Tracking**
+Every attempt — provider used, response, latency, outcome — is written to PostgreSQL and visible in the dashboard, from `QUEUED → PROCESSING → RETRYING → DELIVERED` (or `FAILED`).
 
 ---
 
-# Core Components
+## Core Features
 
-| Component           | Responsibility                                            |
-| ------------------- | --------------------------------------------------------- |
-| **Spring Boot**     | REST API and application logic                            |
-| **PostgreSQL**      | Notification state, users, templates and delivery history |
-| **Kafka**           | Asynchronous notification processing                      |
-| **Redis**           | Rate limiting and caching                                 |
-| **Spring Data JPA** | Database persistence                                      |
-| **Spring Security** | API-key based service authentication                      |
-| **Docker**          | Containerized deployment                                  |
-
----
-
-# Database Model
-
-```text
-User
- ├── id
- ├── name
- ├── email
- ├── phone
- └── notification preferences
-
-NotificationTemplate
- ├── id
- ├── type
- ├── subject
- └── body
-
-Notification
- ├── id
- ├── idempotency_key (UNIQUE)
- ├── user_id
- ├── template_id
- ├── channel
- ├── status
- ├── created_at
- └── updated_at
-
-DeliveryAttempt
- ├── id
- ├── notification_id
- ├── attempt_number
- ├── status
- ├── error_message
- └── attempted_at
-```
-
-The separation between `Notification` and `DeliveryAttempt` allows PulseRelay to maintain the **current notification state** while preserving the complete delivery history.
+- **Single API, multi-channel delivery** — Email, SMS, and Push behind one endpoint
+- **Policy-driven routing** — per-event delivery policy plus per-user channel preferences
+- **Provider abstraction & failover** — swap or add providers without client-side changes
+- **Templating** — versioned, variable-driven message templates per event type
+- **Retry with exponential backoff** — configurable per channel/provider
+- **Dead-letter queue** — failed notifications are preserved, not dropped
+- **Idempotency** — safe against duplicate event delivery from the client side
+- **Rate limiting** — per-organization request throttling via Redis, protecting both PulseRelay and upstream providers
+- **Delivery history & audit trail** — every attempt, per notification, queryable
+- **Developer dashboard** — send volume, delivery/failure rates, DLQ inspection, per-notification drill-down
 
 ---
 
-# Design Patterns
+## Tech Stack
 
-### Strategy Pattern
-
-Different notification channels implement a common interface:
-
-```java
-NotificationChannel
-       │
- ┌─────┼─────┐
- ↓     ↓     ↓
-Email  SMS   Push
-```
-
-Adding another channel does not require rewriting the notification processing logic.
-
-### Factory Pattern
-
-Responsible for creating notification-related objects based on the requested channel and template.
-
-### State Pattern
-
-Controls valid notification lifecycle transitions such as:
-
-```text
-PENDING → PROCESSING → SENT
-PENDING → RETRYING → FAILED
-```
+| Layer | Technology |
+|---|---|
+| API / backend | Java 17, Spring Boot 3, Spring Security (API-key auth) |
+| Event streaming | Apache Kafka |
+| Database | PostgreSQL |
+| Caching / rate limiting | Redis |
+| Providers | SendGrid (Email), Twilio (SMS), Firebase Cloud Messaging (Push) |
+| Frontend | React |
+| Observability | Prometheus, Grafana |
+| Infrastructure | Docker, Docker Compose; CI via GitHub Actions |
 
 ---
 
-# API Overview
+## Getting Started
 
-| Method | Endpoint                  | Purpose                      |
-| ------ | ------------------------- | ---------------------------- |
-| `POST` | `/api/notifications`      | Create notification          |
-| `GET`  | `/api/notifications/{id}` | Get notification status      |
-| `GET`  | `/api/templates`          | List notification templates  |
-| `POST` | `/api/templates`          | Create notification template |
+### Prerequisites
+- Docker & Docker Compose
+- Java 17+
+- A SendGrid API key (email) and/or Twilio trial credentials (SMS) for live delivery testing
 
-> API endpoints may evolve as development progresses.
-
----
-
-# Technology Stack
-
-**Backend**
-
-* Java
-* Spring Boot
-* Spring Data JPA
-* Spring Security
-* Maven
-
-**Database**
-
-* PostgreSQL
-
-**Messaging & Distributed Systems**
-
-* Apache Kafka
-* Redis
-
-**DevOps**
-
-* Docker
-
-**Testing & API**
-
-* Postman
-* JUnit
-
----
-
-# Project Structure
-
-```text
-pulserelay/
-├── src/
-│   ├── main/
-│   │   ├── java/
-│   │   │   └── com/pulserelay/
-│   │   │       ├── controller/
-│   │   │       ├── service/
-│   │   │       ├── repository/
-│   │   │       ├── model/
-│   │   │       ├── dto/
-│   │   │       ├── strategy/
-│   │   │       └── config/
-│   │   └── resources/
-│   │       └── application.yml
-│   │
-│   └── test/
-│
-├── docker-compose.yml
-├── Dockerfile
-├── pom.xml
-└── README.md
-```
-
----
-
-# Getting Started
-
-## Prerequisites
-
-Make sure you have:
-
-* Java 17+
-* Maven
-* Docker
-* PostgreSQL
-* Kafka
-* Redis
-
-## Clone the Repository
-
+### Run locally
 ```bash
-git clone https://github.com/AyaanB24/PulseRelay.git
-cd PulseRelay
+git clone https://github.com/AyaanB24/pulserelay.git
+cd pulserelay
+cp .env.example .env        # add your provider API keys
+docker compose up -d        # Kafka, Redis, PostgreSQL, app
 ```
 
-## Run with Docker
+The API is available at `http://localhost:8080`, and the dashboard at `http://localhost:3000`.
 
+### Send a test notification
 ```bash
-docker compose up --build
-```
-
-## Run with Maven
-
-```bash
-mvn spring-boot:run
-```
-
-The API will be available at:
-
-```text
-http://localhost:8080
+curl -X POST http://localhost:8080/api/v1/notifications \
+  -H "Authorization: Bearer pr_live_xxxxxxxxxxxxx" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "event": "ORDER_CONFIRMED",
+        "userId": "user_123",
+        "data": { "orderId": "ORD-4821", "amount": 2499 }
+      }'
 ```
 
 ---
 
-# Reliability Flow
+## API Reference
 
-PulseRelay is designed around reliable notification processing:
+| Endpoint | Method | Description |
+|---|---|---|
+| `/api/v1/notifications` | `POST` | Submit a notification event |
+| `/api/v1/notifications/{id}` | `GET` | Get status and delivery attempt history |
+| `/api/v1/templates` | `POST` / `GET` | Create or list message templates |
+| `/api/v1/users/{id}/preferences` | `PUT` / `GET` | Set or fetch a user's channel preferences |
+| `/api/v1/api-keys` | `POST` | Issue a new API key for an organization |
 
-```text
-API Request
-    ↓
-API Key Validation
-    ↓
-Idempotency Check
-    ↓
-Create Notification
-    ↓
-Kafka
-    ↓
-Worker
-    ↓
-Channel Handler
-    ↓
-Delivery
-    ↓
-Success?
- ┌──┴──┐
-Yes    No
- ↓      ↓
-SENT   Retry
-         ↓
-    Max Attempts?
-      ┌──┴──┐
-     No     Yes
-      ↓      ↓
-    Retry  FAILED
+Full request/response schemas are documented in [`/docs/api.md`](./docs/api.md).
+
+---
+
+## Reliability Design
+
+**Retry + failover example (payment failure, high priority):**
+```
+PAYMENT_FAILED
+   → priority: HIGH
+   → user preference: SMS
+   → Provider A: unhealthy
+   → Provider B: attempted
+   → Provider B: FAILED
+   → channel fallback: PUSH
+   → DELIVERED
+```
+
+- **Retries** use exponential backoff, tracked in Redis so retry state survives worker restarts.
+- **Provider failover** switches to a secondary provider within the same channel before giving up on that channel.
+- **Channel fallback** (e.g., Email → SMS) is policy-configurable per event type.
+- **Dead-letter queue** captures anything that exhausts every retry and fallback path, so nothing is silently lost.
+- **Idempotency keys** prevent duplicate sends if the client retries the same event.
+
+---
+
+## Data Model
+
+PostgreSQL is the durable source of truth for:
+
+```
+Organizations
+API Keys
+Users
+User Preferences
+Templates
+Notifications
+Delivery Attempts
+Provider Configurations
+Usage Metrics
+```
+
+A single notification's lifecycle:
+```
+QUEUED → PROCESSING → RETRYING → DELIVERED
+                    └──────────→ FAILED → DLQ
 ```
 
 ---
 
-# Why PulseRelay?
+## Observability
 
-Without a centralized notification service, individual backend applications may need to implement:
-
-```text
-Email integration
-SMS integration
-Push integration
-Retry logic
-Failure handling
-Delivery tracking
-Rate limiting
-Duplicate prevention
-```
-
-PulseRelay moves these responsibilities into a **single reusable service**.
-
-```text
-Multiple Backend Services
-          ↓
-      PulseRelay
-          ↓
- Reliable Notification Delivery
-```
+- **Prometheus** scrapes queue lag, delivery success/failure rate, and per-provider latency.
+- **Grafana** dashboards visualize throughput, failure trends, and DLQ growth.
+- The developer dashboard surfaces the same data in product form: send volume, delivery rate, and per-notification attempt logs.
 
 ---
 
-# Future Improvements
+## Roadmap
 
-Planned improvements include:
+**Built / in progress**
+- [x] Multi-tenant organizations & API-key auth
+- [x] REST API + Kafka-backed async processing
+- [x] Email delivery via SendGrid (real inbox delivery)
+- [x] Templates, user preferences, idempotency
+- [x] Retry with exponential backoff
+- [x] Delivery history & React dashboard
+- [x] Docker Compose local deployment
 
-* WhatsApp notification channel
-* Multiple email/SMS providers
-* Provider health monitoring
-* Dead Letter Queue (DLQ)
-* Kafka consumer scaling
-* Circuit breaker for unhealthy providers
-* Notification scheduling
-* Advanced analytics dashboard
-* Prometheus and Grafana monitoring
-* Kubernetes deployment
-* Distributed tracing
-
----
-
-# Key Learning Areas
-
-This project demonstrates practical understanding of:
-
-* REST API design
-* Spring Boot
-* Spring Security
-* Database transactions
-* Idempotency
-* Database constraints
-* Retry strategies
-* Exponential backoff
-* Asynchronous processing
-* Kafka
-* Redis
-* OOP and design patterns
-* Distributed systems
-* Containerization
-* Service-to-service authentication
+**Planned**
+- [ ] SMS (Twilio) and Push (FCM) channels
+- [ ] Provider health checks & automatic failover
+- [ ] Channel fallback policies
+- [ ] Outbound webhooks for delivery events
+- [ ] Usage-based billing
+- [ ] Production deployment (AWS)
 
 ---
 
-# Project Status
+## Project Status
 
-**Status:** In Development
-
-PulseRelay is being developed incrementally, starting with the core notification API and database layer, followed by asynchronous processing, retry handling, channel fallback, security, and observability.
+PulseRelay is an active portfolio project built to demonstrate event-driven backend architecture, delivery reliability engineering, and operational observability — not a toy demo. The Email path is built end-to-end: a real external request results in a real inbox delivery, with the full retry/tracking machinery around it, before additional channels are added.
 
 ---
 
-## Author
+## License
 
-**Ayaan Bargir**
-
-Computer Science & Engineering
-Java Backend & DevOps
+MIT © [Ayaan Bargir](https://github.com/AyaanB24)

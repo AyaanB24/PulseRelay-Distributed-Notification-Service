@@ -325,12 +325,9 @@ attempted_at
 
 ---
 
-## Project Status
 
-PulseRelay is an active portfolio project built to demonstrate event-driven backend architecture, delivery reliability engineering, and operational observability — not a toy demo. The Email path is built end-to-end: a real external request results in a real inbox delivery, with the full retry/tracking machinery around it, before additional channels are added.
 
----
 
 ## License
 
-MIT © [Ayaan Bargir](https://github.com/AyaanB24)
+Private - All rights reserved

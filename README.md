@@ -60,81 +60,79 @@ PulseRelay's core differentiator is not "sending notifications" — that's commo
 ## Architecture
 
 ```mermaid
-flowchart LR
-    subgraph Client["Client"]
-        App["ShopX Backend"]
-    end
+flowchart TB
+    Client["Client Application"] -- "POST /notifications" --> API
 
     subgraph API["PulseRelay API"]
         Auth["API Key Auth"]
-        Persist["Persist + Publish"]
+        Validate["Validation"]
+        Auth --> Validate
     end
 
-    subgraph Queue["Message Queue"]
-        Kafka["Kafka<br/>notifications.events"]
-        DLQ["Kafka DLQ"]
+    Validate -- "persist + publish" --> PG1[("PostgreSQL<br/>Notification: QUEUED")]
+    Validate -- "persist + publish" --> Kafka["Kafka<br/>notification.events"]
+    API -- "202 Accepted" --> Client
+
+    Kafka --> Worker
+
+    subgraph Worker["Worker Pool"]
+        direction TB
+        Idem["1 · Idempotency Check"]
+        Pref["2 · Preference Lookup"]
+        Route["3 · Delivery Decision Engine"]
+        Template["4 · Template Rendering"]
+        Limit["5 · Rate Limit Check"]
+        Idem --> Pref --> Route --> Template --> Limit
     end
 
-    subgraph Engine["Notification Worker Pool"]
-        Pref["Preference Lookup"]
-        Idem["Idempotency Check"]
-        Policy["Routing Policy"]
-        Template["Template Render"]
-        Limit["Rate Limit Check"]
+    Idem -. "unique idempotency_key" .-> PG1
+    Pref -. "read preferences" .-> PG1
+
+    subgraph Decision["Delivery Decision Engine"]
+        direction LR
+        Pri["Preferences"]
+        Pr2["Priority"]
+        Health["Provider Health"]
+    end
+    Route -.-> Decision
+
+    Limit -- "check + increment" --> Redis[("Redis<br/>rate limits, counters")]
+
+    Limit --> Channel
+
+    subgraph Channel["Notification Channel (abstraction)"]
+        direction LR
+        EmailCh["Email"]
+        SmsCh["SMS"]
+        PushCh["Push"]
     end
 
-    subgraph Providers["Delivery Providers"]
-        SendGrid["SendGrid — Email"]
-        Twilio["Twilio — SMS"]
-        FCM["FCM — Push"]
-    end
+    EmailCh --> SendGrid["SendGrid"]
+    SmsCh --> Twilio["Twilio"]
+    PushCh --> FCM["FCM"]
 
-    subgraph Storage["Data Storage"]
-        PG[("PostgreSQL")]
-        Redis[("Redis")]
-    end
+    SendGrid --> Result["Delivery Result"]
+    Twilio --> Result
+    FCM --> Result
 
-    subgraph Observability["Observability Stack"]
-        Prom["Prometheus"]
-        Grafana["Grafana"]
-    end
+    Result -- "UPDATE Notification.status<br/>INSERT DeliveryAttempt" --> PG2[("PostgreSQL<br/>Attempts, audit trail")]
 
-    App -- "HTTPS POST /notifications" --> Auth
-    Auth --> Persist
-    Persist -- "write QUEUED" --> PG
-    Persist -- "publish event" --> Kafka
-    Persist -- "202 Accepted" --> App
+    Result -- "on failure" --> Retry["Retry + Exponential Backoff"]
+    Retry -- "attempt again" --> Channel
+    Retry -- "max attempts reached" --> DLQ["Kafka DLQ"]
 
-    Kafka -- "consume" --> Pref
-    Pref -- "read prefs" --> PG
-    Pref --> Idem
-    Idem -- "check key" --> Redis
-    Idem --> Policy
-    Policy --> Template
-    Template --> Limit
-    Limit -- "check limit" --> Redis
-
-    Limit -- "execute" --> SendGrid
-    Limit -- "execute" --> Twilio
-    Limit -- "execute" --> FCM
-
-    SendGrid -- "result" --> PG
-    Twilio -- "result" --> PG
-    FCM -- "result" --> PG
-
-    SendGrid -. "on failure, exhausted retries" .-> DLQ
-    Twilio -. "on failure, exhausted retries" .-> DLQ
-    FCM -. "on failure, exhausted retries" .-> DLQ
-
-    API -- "metrics" --> Prom
-    Engine -- "metrics" --> Prom
-    Prom -- "query" --> Grafana
+    API -- metrics --> Prom["Prometheus"]
+    Worker -- metrics --> Prom
+    Kafka -- metrics --> Prom
+    Prom -- query --> Grafana["Grafana"]
 ```
 
 **Why it's built this way:**
-- The API never blocks on provider delivery — it writes to Postgres, publishes to Kafka, and returns `202` in milliseconds. Delivery happens on the worker side, independently.
-- Preferences, idempotency, and rate-limit checks happen **inside the worker**, right before a provider is called — not in the API layer — so a burst of inbound requests doesn't get rejected outright, it gets queued and throttled downstream.
-- Postgres is written to twice in the lifecycle: once at ingestion (`QUEUED`) and again at delivery outcome (`DELIVERED`/`FAILED`) — that's what makes the dashboard's delivery history accurate rather than inferred.
+- **Idempotency runs first**, before any preference lookup or routing work, checked against a `UNIQUE` constraint on `idempotency_key` in PostgreSQL — Redis can short-circuit the common case, but Postgres is the final authority so a Kafka redelivery can never slip through as a duplicate at the database layer.
+- **The Delivery Decision Engine** — not a plain routing lookup — is the actual product feature: it weighs user preference, event priority, and live provider health together to pick a channel *and* a provider, which is what makes automatic failover possible.
+- **Every provider call happens behind a `NotificationChannel` abstraction**, not a direct SDK call from the worker. Adding a provider or failing over from one to another (SendGrid → a backup email provider) means adding an implementation, not rewriting the worker.
+- **Retry is explicit and bounded**: each failure is retried with exponential backoff and a capped attempt count, with every attempt recorded — only after attempts are exhausted does a message move to the DLQ. Nothing fails silently and nothing skips straight to the DLQ.
+- **Redis and PostgreSQL have distinct jobs**: Redis holds fast, ephemeral state (rate-limit counters, idempotency fast-path); PostgreSQL holds durable state (notification status, the full `DeliveryAttempt` history) — rate limiting is never backed by Postgres.
 
 ---
 
@@ -263,11 +261,13 @@ PAYMENT_FAILED
    → DELIVERED
 ```
 
-- **Retries** use exponential backoff, tracked in Redis so retry state survives worker restarts.
+- **Retries** use exponential backoff (e.g., 2s → 4s → 8s → 16s), tracked in Redis so retry state survives worker restarts. Each attempt is logged as a `DeliveryAttempt` row before the next one runs.
 - **Provider failover** switches to a secondary provider within the same channel before giving up on that channel.
 - **Channel fallback** (e.g., Email → SMS) is policy-configurable per event type.
 - **Dead-letter queue** captures anything that exhausts every retry and fallback path, so nothing is silently lost.
-- **Idempotency keys** prevent duplicate sends if the client retries the same event.
+- **Idempotency keys**, enforced with a `UNIQUE` constraint on `notification.idempotency_key`, stop PulseRelay from reprocessing the same inbound event twice (e.g., on Kafka redelivery).
+
+**A known, honest limitation:** idempotency at the database layer prevents PulseRelay from reprocessing its own event twice — it cannot guarantee a provider never delivers a message twice. If a provider sends an email successfully but the network response to PulseRelay is lost, PulseRelay may see that as a failure and retry, causing a duplicate at the provider. This is a real constraint of any system that crosses a network boundary it doesn't control. The accurate claim is: *PulseRelay provides idempotent processing and minimizes duplicate delivery through database constraints, provider-side idempotency where supported, and controlled retries* — not a hard guarantee of exactly-once delivery end to end.
 
 ---
 
@@ -292,6 +292,31 @@ A single notification's lifecycle:
 QUEUED → PROCESSING → RETRYING → DELIVERED
                     └──────────→ FAILED → DLQ
 ```
+
+Core tables, simplified:
+```
+Notification
+────────────────────
+id
+idempotency_key      UNIQUE
+user_id
+channel
+status                -- QUEUED | PROCESSING | RETRYING | DELIVERED | FAILED
+provider
+created_at
+updated_at
+
+DeliveryAttempt
+────────────────────
+id
+notification_id       -- FK → Notification
+attempt_number
+provider
+status
+error_message
+attempted_at
+```
+`Notification` holds current state; `DeliveryAttempt` holds one row per try, which is what makes the dashboard's per-notification drill-down (`ntf_1023 → attempt #1 timeout, #2 rate limited, #3 rejected`) possible instead of just a final status.
 
 ---
 

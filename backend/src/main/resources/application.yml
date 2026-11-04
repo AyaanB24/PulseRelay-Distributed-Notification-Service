@@ -33,6 +33,7 @@ logging:
     org.springframework.web: DEBUG
     org.hibernate.SQL: DEBUG
     org.hibernate.type.descriptor.sql.BasicBinder: TRACE
+    org.springframework.security: DEBUG
 
 management:
   endpoints:
@@ -42,3 +43,11 @@ management:
   endpoint:
     health:
       show-details: when-authorized
+
+# PulseRelay-specific configuration
+pulserelay:
+  admin:
+    # Admin secret for tenant registration endpoint
+    # Required for POST /api/v1/admin/tenants
+    # Set via environment variable: PULSERELAY_ADMIN_SECRET
+    secret: ${PULSERELAY_ADMIN_SECRET:#{null}}

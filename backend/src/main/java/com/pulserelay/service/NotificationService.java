@@ -10,12 +10,19 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 
 /**
  * Service for managing notifications.
  * Handles validation, persistence, and idempotency.
+ * 
+ * Implements the Transactional Outbox Pattern:
+ * - Saves notification to database
+ * - Creates outbox event in the same transaction
+ * - Outbox publisher later sends the event to Kafka
  */
 @Service
 @Slf4j
@@ -23,9 +30,16 @@ import java.util.UUID;
 public class NotificationService {
 
     private final NotificationRepository notificationRepository;
+    private final OutboxService outboxService;
 
     /**
      * Submit a new notification or return existing one for duplicate requests.
+     * 
+     * Implements Transactional Outbox Pattern:
+     * - Saves notification to database
+     * - Creates outbox event in the same transaction
+     * - If either fails, both are rolled back
+     * - Outbox publisher will later send the event to Kafka
      * 
      * Idempotency: If a notification with the same tenant + idempotency key exists,
      * return the existing notification instead of creating a duplicate.
@@ -69,6 +83,18 @@ public class NotificationService {
         log.info("Notification created: ID {} for tenant {} with event type {}", 
             notification.getId(), tenant.getId(), request.getEventType());
 
+        // Create outbox event in the same transaction
+        // This ensures the notification and event are persisted atomically
+        Map<String, Object> notificationData = buildNotificationData(request);
+        outboxService.createOutboxEvent(
+            notification.getId(),
+            tenant.getId(),
+            notification.getCreatedAt(),
+            notificationData
+        );
+
+        log.info("Outbox event created for notification: {}", notification.getId());
+
         return notification;
     }
 
@@ -109,5 +135,21 @@ public class NotificationService {
     public Notification getNotificationById(UUID notificationId) {
         return notificationRepository.findById(notificationId)
             .orElseThrow(() -> new NotificationException("Notification not found: " + notificationId));
+    }
+
+    /**
+     * Build notification data for outbox event payload.
+     * Excludes sensitive information like API keys.
+     */
+    private Map<String, Object> buildNotificationData(NotificationRequest request) {
+        Map<String, Object> data = new HashMap<>();
+        data.put("eventType", request.getEventType());
+        data.put("recipientEmail", request.getRecipientEmail());
+        data.put("recipientPhone", request.getRecipientPhone());
+        data.put("recipientUserId", request.getRecipientUserId());
+        data.put("requestedChannels", request.getRequestedChannels());
+        data.put("priority", request.getPriority());
+        data.put("payload", request.getPayload());
+        return data;
     }
 }

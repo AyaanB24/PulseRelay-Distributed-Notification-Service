@@ -42,6 +42,7 @@
 			<groupId>org.springframework.boot</groupId>
 			<artifactId>spring-boot-starter-validation</artifactId>
 		</dependency>
+		
 		<dependency>
 			<groupId>org.springframework.boot</groupId>
 			<artifactId>spring-boot-starter-webmvc</artifactId>
@@ -55,6 +56,33 @@
 			<groupId>org.postgresql</groupId>
 			<artifactId>postgresql</artifactId>
 			<scope>runtime</scope>
+		</dependency>
+		<dependency>
+			<groupId>org.springframework.kafka</groupId>
+			<artifactId>spring-kafka</artifactId>
+		</dependency>
+		<dependency>
+			<groupId>org.flywaydb</groupId>
+			<artifactId>flyway-core</artifactId>
+		</dependency>
+		<dependency>
+			<groupId>org.flywaydb</groupId>
+			<artifactId>flyway-database-postgresql</artifactId>
+		</dependency>
+		<!-- Jackson Databind: Required by Spring Kafka's JsonSerializer for Kafka message serialization -->
+		<!-- Spring Boot 4.1.1 includes tools.jackson but Spring Kafka needs com.fasterxml.jackson -->
+		<!-- This explicit dependency ensures compatibility between Kafka and Jackson -->
+		<dependency>
+			<groupId>com.fasterxml.jackson.core</groupId>
+			<artifactId>jackson-databind</artifactId>
+			<version>2.17.2</version>
+		</dependency>
+		<!-- Jackson JSR310: Support for Java 8 date/time types (LocalDateTime, LocalDate, etc.) -->
+		<!-- Required for serializing timestamps in Kafka messages and Hibernate JSON columns -->
+		<dependency>
+			<groupId>com.fasterxml.jackson.datatype</groupId>
+			<artifactId>jackson-datatype-jsr310</artifactId>
+			<version>2.17.2</version>
 		</dependency>
 		<dependency>
 			<groupId>org.projectlombok</groupId>

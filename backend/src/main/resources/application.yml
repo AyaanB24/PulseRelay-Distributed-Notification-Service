@@ -2,6 +2,12 @@ spring:
   application:
     name: pulserelay
 
+  # Disable default static resource handling to prevent API routes from being treated as static resources
+  mvc:
+    static-path-pattern: /static/**
+    resources:
+      add-mappings: false
+
   # Database Configuration
   datasource:
     url: jdbc:postgresql://localhost:5432/pulserelay_dev
@@ -11,7 +17,7 @@ spring:
 
   jpa:
     hibernate:
-      ddl-auto: validate  # Let Flyway handle migrations, Hibernate just validates
+      ddl-auto: none  # Flyway handles ALL database changes, Hibernate does nothing
     properties:
       hibernate:
         dialect: org.hibernate.dialect.PostgreSQLDialect
@@ -26,6 +32,8 @@ spring:
     locations: classpath:db/migration
     baselineOnMigrate: true
     schemas: public
+    outOfOrder: false
+    validateOnMigrate: true
 
   # Kafka Configuration
   kafka:

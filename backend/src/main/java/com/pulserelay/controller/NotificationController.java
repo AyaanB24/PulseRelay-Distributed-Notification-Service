@@ -3,8 +3,12 @@ package com.pulserelay.controller;
 import com.pulserelay.config.TenantPrincipal;
 import com.pulserelay.dto.NotificationRequest;
 import com.pulserelay.dto.NotificationResponse;
+import com.pulserelay.dto.TestDeliveryRequest;
+import com.pulserelay.dto.TestDeliveryResponse;
+import com.pulserelay.entity.DeliveryAttempt;
 import com.pulserelay.entity.Notification;
 import com.pulserelay.entity.Tenant;
+import com.pulserelay.service.DeliveryService;
 import com.pulserelay.service.NotificationService;
 import com.pulserelay.service.TenantService;
 import jakarta.validation.Valid;
@@ -29,6 +33,7 @@ public class NotificationController {
 
     private final NotificationService notificationService;
     private final TenantService tenantService;
+    private final DeliveryService deliveryService;
 
     /**
      * Submit a new notification.
@@ -137,6 +142,108 @@ public class NotificationController {
 
         } catch (Exception exception) {
             log.error("Unexpected error while submitting notification", exception);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
+        }
+    }
+
+    /**
+     * Test delivery endpoint for testing notification delivery through providers.
+     * This endpoint is intended for testing purposes only.
+     * 
+     * Endpoint: POST /api/v1/notifications/test-delivery
+     * 
+     * Headers:
+     *   X-API-KEY: The tenant's API key (required)
+     *   Content-Type: application/json
+     * 
+     * Request body:
+     * {
+     *   "channel": "EMAIL",
+     *   "recipient": "test@example.com",
+     *   "subject": "Test Subject",
+     *   "body": "Test message body"
+     * }
+     * 
+     * Response (200 OK):
+     * {
+     *   "id": "550e8400-e29b-41d4-a716-446655440000",
+     *   "status": "DELIVERED",
+     *   "channel": "EMAIL",
+     *   "provider": "MockEmail",
+     *   "recipient": "test@example.com",
+     *   "providerMessageId": "mock-uuid",
+     *   "errorCode": null,
+     *   "errorMessage": null,
+     *   "isRetryable": false,
+     *   "attemptedAt": "2026-11-14T18:30:00Z"
+     * }
+     * 
+     * Response (400 Bad Request):
+     * - Invalid request body (validation errors)
+     * - Missing required fields
+     * - Unsupported channel
+     * 
+     * Response (401 Unauthorized):
+     * - Missing or invalid X-API-KEY
+     * 
+     * @param request The test delivery request
+     * @return TestDeliveryResponse with delivery result
+     */
+    @PostMapping("/test-delivery")
+    public ResponseEntity<TestDeliveryResponse> testDelivery(
+            @Valid @RequestBody TestDeliveryRequest request) {
+
+        try {
+            // Extract authenticated tenant from SecurityContext
+            Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
+            if (authentication == null || !authentication.isAuthenticated()) {
+                log.warn("No authenticated principal found in security context");
+                return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+            }
+
+            Object principal = authentication.getPrincipal();
+            if (!(principal instanceof TenantPrincipal)) {
+                log.error("Principal is not a TenantPrincipal: {}", principal.getClass().getName());
+                return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
+            }
+
+            TenantPrincipal tenantPrincipal = (TenantPrincipal) principal;
+
+            log.info("Test delivery requested: channel={}, recipient={}", 
+                    request.getChannel(), request.getRecipient());
+
+            // Execute delivery through the provider
+            DeliveryAttempt attempt = deliveryService.executeDelivery(
+                    tenantPrincipal.getTenantId(),
+                    null,  // No notification ID for test delivery
+                    request.getChannel(),
+                    request.getRecipient(),
+                    request.getSubject() != null ? request.getSubject() : "",
+                    request.getBody());
+
+            // Map to response DTO
+            TestDeliveryResponse response = TestDeliveryResponse.builder()
+                    .id(attempt.getId())
+                    .status(attempt.getStatus().toString())
+                    .channel(attempt.getChannel())
+                    .provider(attempt.getProvider())
+                    .recipient(attempt.getRecipient())
+                    .providerMessageId(attempt.getProviderMessageId())
+                    .errorCode(attempt.getErrorCode())
+                    .errorMessage(attempt.getErrorMessage())
+                    .isRetryable(attempt.getIsRetryable())
+                    .attemptedAt(attempt.getAttemptedAt())
+                    .build();
+
+            log.debug("Test delivery completed: status={}", attempt.getStatus());
+
+            return ResponseEntity.ok(response);
+
+        } catch (IllegalArgumentException e) {
+            log.warn("Invalid test delivery request: {}", e.getMessage());
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).build();
+        } catch (Exception exception) {
+            log.error("Unexpected error during test delivery", exception);
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
         }
     }

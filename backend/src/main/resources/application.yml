@@ -70,6 +70,19 @@ spring:
       org.springframework.kafka: INFO
       org.hibernate.SQL: DEBUG
 
+  # Mail Configuration for SMTP (Phase 09)
+  mail:
+    host: ${PULSERELAY_SMTP_HOST:localhost}
+    port: ${PULSERELAY_SMTP_PORT:1025}
+    username: ${PULSERELAY_SMTP_USERNAME:}
+    password: ${PULSERELAY_SMTP_PASSWORD:}
+    properties:
+      mail:
+        smtp:
+          auth: ${PULSERELAY_SMTP_AUTH:false}
+          starttls:
+            enable: ${PULSERELAY_SMTP_STARTTLS:false}
+
 # PulseRelay Application Configuration
 pulserelay:
   # Outbox Pattern Configuration (Phase 05)
@@ -88,6 +101,11 @@ pulserelay:
   kafka:
     topic:
       notifications: notification-events
+
+  # Provider Configuration (Phase 09)
+  provider:
+    email:
+      type: smtp  # Options: mock, smtp (use smtp for real email delivery)
 
 # Server Configuration
 server:

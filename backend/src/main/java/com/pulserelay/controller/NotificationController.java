@@ -3,8 +3,8 @@ package com.pulserelay.controller;
 import com.pulserelay.config.TenantPrincipal;
 import com.pulserelay.dto.NotificationRequest;
 import com.pulserelay.dto.NotificationResponse;
+import com.pulserelay.dto.RetryDeliveryResponse;
 import com.pulserelay.dto.TestDeliveryRequest;
-import com.pulserelay.dto.TestDeliveryResponse;
 import com.pulserelay.entity.DeliveryAttempt;
 import com.pulserelay.entity.Notification;
 import com.pulserelay.entity.Tenant;
@@ -167,14 +167,15 @@ public class NotificationController {
      * Response (200 OK):
      * {
      *   "id": "550e8400-e29b-41d4-a716-446655440000",
-     *   "status": "DELIVERED",
+     *   "status": "RETRY_SCHEDULED",
      *   "channel": "EMAIL",
      *   "provider": "MockEmail",
      *   "recipient": "test@example.com",
      *   "providerMessageId": "mock-uuid",
-     *   "errorCode": null,
-     *   "errorMessage": null,
-     *   "isRetryable": false,
+     *   "errorCode": "TRANSIENT_ERROR",
+     *   "errorMessage": "Mock transient failure",
+     *   "isRetryable": true,
+     *   "nextAttemptAt": "2026-11-15T00:00:01Z",
      *   "attemptedAt": "2026-11-14T18:30:00Z"
      * }
      * 
@@ -187,10 +188,10 @@ public class NotificationController {
      * - Missing or invalid X-API-KEY
      * 
      * @param request The test delivery request
-     * @return TestDeliveryResponse with delivery result
+     * @return RetryDeliveryResponse with delivery result and retry status
      */
     @PostMapping("/test-delivery")
-    public ResponseEntity<TestDeliveryResponse> testDelivery(
+    public ResponseEntity<RetryDeliveryResponse> testDelivery(
             @Valid @RequestBody TestDeliveryRequest request) {
 
         try {
@@ -222,7 +223,7 @@ public class NotificationController {
                     request.getBody());
 
             // Map to response DTO
-            TestDeliveryResponse response = TestDeliveryResponse.builder()
+            RetryDeliveryResponse response = RetryDeliveryResponse.builder()
                     .id(attempt.getId())
                     .status(attempt.getStatus().toString())
                     .channel(attempt.getChannel())
@@ -233,9 +234,11 @@ public class NotificationController {
                     .errorMessage(attempt.getErrorMessage())
                     .isRetryable(attempt.getIsRetryable())
                     .attemptedAt(attempt.getAttemptedAt())
+                    .nextAttemptAt(attempt.getNextAttemptAt())
                     .build();
 
-            log.debug("Test delivery completed: status={}", attempt.getStatus());
+            log.debug("Test delivery completed: status={}, nextAttemptAt={}", 
+                    attempt.getStatus(), attempt.getNextAttemptAt());
 
             return ResponseEntity.ok(response);
 

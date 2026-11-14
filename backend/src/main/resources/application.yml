@@ -85,6 +85,10 @@ spring:
 
 # PulseRelay Application Configuration
 pulserelay:
+  # Admin secret for tenant management endpoints
+  admin:
+    secret: admin-secret-key-2026
+
   # Outbox Pattern Configuration (Phase 05)
   outbox:
     poll-interval: 5000  # Poll for eligible events every 5 seconds
@@ -105,7 +109,15 @@ pulserelay:
   # Provider Configuration (Phase 09)
   provider:
     email:
-      type: smtp  # Options: mock, smtp (use smtp for real email delivery)
+      type: mock  # Options: mock, smtp (use smtp for real email delivery)
+
+  # Retry Policy Configuration (Phase 10)
+  retry:
+    policy:
+      max-attempts: 5  # Maximum retry attempts (including initial)
+      initial-delay-ms: 1000  # Initial delay: 1 second
+      max-delay-ms: 60000  # Max delay: 60 seconds
+      backoff-multiplier: 2.0  # Exponential backoff multiplier
 
 # Server Configuration
 server:

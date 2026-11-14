@@ -98,11 +98,16 @@ public class SmtpEmailProvider implements NotificationProvider {
 
     private boolean isRetryableError(Exception e) {
         String message = e.getMessage();
-        if (message == null) return true;
+        String className = e.getClass().getSimpleName();
+        
+        if (message == null) message = "";
 
-        // These errors are permanent (non-retryable)
+        // These errors are PERMANENT (non-retryable)
         return !message.contains("Invalid email address") &&
                 !message.contains("User unknown") &&
-                !message.contains("Recipient rejected");
+                !message.contains("Recipient rejected") &&
+                !message.contains("Authentication failed") &&
+                !message.contains("Invalid credentials") &&
+                !className.contains("AuthenticationException");
     }
 }

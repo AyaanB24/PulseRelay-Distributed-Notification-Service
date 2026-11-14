@@ -24,13 +24,16 @@ public class DeliveryService {
 
     private final ProviderRegistry providerRegistry;
     private final DeliveryAttemptRepository deliveryAttemptRepository;
+    private final RetryScheduler retryScheduler;
 
     @Autowired
     public DeliveryService(
             ProviderRegistry providerRegistry,
-            DeliveryAttemptRepository deliveryAttemptRepository) {
+            DeliveryAttemptRepository deliveryAttemptRepository,
+            RetryScheduler retryScheduler) {
         this.providerRegistry = providerRegistry;
         this.deliveryAttemptRepository = deliveryAttemptRepository;
+        this.retryScheduler = retryScheduler;
     }
 
     /**
@@ -99,6 +102,16 @@ public class DeliveryService {
 
         attempt = deliveryAttemptRepository.save(attempt);
         log.info("Delivery attempt recorded: id={}, status={}", attempt.getId(), attempt.getStatus());
+
+        // Phase 10: Schedule retry if failure is transient
+        if (result.getStatus() == DeliveryResult.DeliveryStatus.FAILED && result.isRetryable()) {
+            if (retryScheduler.shouldRetry(attempt)) {
+                attempt = retryScheduler.scheduleRetry(attempt);
+                attempt = deliveryAttemptRepository.save(attempt);
+                log.info("Retry scheduled for notification {}: next attempt at {}", 
+                        notificationId, attempt.getNextAttemptAt());
+            }
+        }
 
         return attempt;
     }

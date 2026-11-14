@@ -60,11 +60,15 @@ public class DeliveryAttempt {
     @Column(nullable = false, updatable = false)
     private Instant attemptedAt;
 
+    @Column(name = "next_attempt_at")
+    private Instant nextAttemptAt;  // When to retry (null if not scheduled)
+
     public enum DeliveryStatus {
         ACCEPTED,           // Provider accepted the request
         DELIVERED,          // Message confirmed delivered
         FAILED,             // Delivery failed (potentially retryable)
-        PERMANENT_FAILURE   // Non-retryable failure
+        PERMANENT_FAILURE,  // Non-retryable failure
+        RETRY_SCHEDULED     // Scheduled for retry
     }
 
     @PrePersist

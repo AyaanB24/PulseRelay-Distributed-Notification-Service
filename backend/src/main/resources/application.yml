@@ -1,0 +1,88 @@
+spring:
+  application:
+    name: pulserelay
+
+  # Database Configuration
+  datasource:
+    url: jdbc:postgresql://localhost:5432/pulserelay_dev
+    username: postgres
+    password: root123
+    driver-class-name: org.postgresql.Driver
+
+  jpa:
+    hibernate:
+      ddl-auto: validate  # Let Flyway handle migrations, Hibernate just validates
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        format_sql: true
+        jdbc:
+          batch_size: 20
+          fetch_size: 50
+
+  # Flyway Configuration for Database Migrations
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baselineOnMigrate: true
+    schemas: public
+
+  # Kafka Configuration
+  kafka:
+    bootstrap-servers: localhost:9092
+
+    # Producer (Phase 05: OutboxPublisher)
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      acks: all  # Wait for all replicas before returning (safe but slower)
+      retries: 3
+      properties:
+        linger.ms: 10  # Batch messages every 10ms
+        batch.size: 16384  # Batch size in bytes
+
+    # Consumer (Phase 06: NotificationEventConsumer)
+    consumer:
+      bootstrap-servers: localhost:9092
+      group-id: pulserelay-consumer-group
+      auto-offset-reset: earliest  # Start from beginning if group is new
+      enable-auto-commit: false  # Manual commit via acknowledgment
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      properties:
+        spring.json.trusted.packages: "com.pulserelay.*"
+        session.timeout.ms: 30000
+        heartbeat.interval.ms: 10000
+
+  # Logging
+  logging:
+    level:
+      root: INFO
+      com.pulserelay: DEBUG
+      org.springframework.kafka: INFO
+      org.hibernate.SQL: DEBUG
+
+# PulseRelay Application Configuration
+pulserelay:
+  # Outbox Pattern Configuration (Phase 05)
+  outbox:
+    poll-interval: 5000  # Poll for eligible events every 5 seconds
+    max-retries: 5  # Maximum retry attempts before marking TERMINAL_FAILED
+    initial-backoff-ms: 1000  # Initial backoff: 1s (doubles with each retry)
+    # Backoff schedule:
+    # - Attempt 1: 1s
+    # - Attempt 2: 2s
+    # - Attempt 3: 4s
+    # - Attempt 4: 8s
+    # - Attempt 5: 16s
+
+  # Kafka Topics
+  kafka:
+    topic:
+      notifications: notification-events
+
+# Server Configuration
+server:
+  port: 8084
+  servlet:
+    context-path: /api

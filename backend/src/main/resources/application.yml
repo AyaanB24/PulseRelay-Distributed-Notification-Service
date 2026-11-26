@@ -109,7 +109,7 @@ pulserelay:
   # Provider Configuration (Phase 09)
   provider:
     email:
-      type: mock  # Options: mock, smtp (use smtp for real email delivery)
+      type: smtp # Options: mock, smtp (use smtp for real email delivery)
 
   # Retry Policy Configuration (Phase 10)
   retry:

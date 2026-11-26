@@ -186,14 +186,21 @@ Every attempt — provider used, response, latency, outcome — is written to Po
 - A SendGrid API key (email) and/or Twilio trial credentials (SMS) for live delivery testing
 
 ### Run locally
-```bash
-git clone https://github.com/AyaanB24/pulserelay.git
-cd pulserelay
-cp .env.example .env        # add your provider API keys
-docker compose up -d        # Kafka, Redis, PostgreSQL, app
-```
 
-The API is available at `http://localhost:8080`, and the dashboard at `http://localhost:3000`.
+**Backend:**
+```bash
+cd backend
+mvn spring-boot:run
+```
+The API is available at `http://localhost:8084`.
+
+**Frontend:**
+```bash
+cd frontend
+npm install
+npm run dev
+```
+The dashboard is available at `http://localhost:5173`.
 
 ### Send a test notification
 ```bash
